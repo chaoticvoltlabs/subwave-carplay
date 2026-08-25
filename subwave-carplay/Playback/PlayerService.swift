@@ -15,62 +15,64 @@
 //  rather than `user:pass@` in the stream URL: AVPlayer silently drops
 //  userinfo from media URLs (docs/private-station.md in the subwave repo,
 //  issue #764), so this is required, not just tidier.
+//
+//  Connection resilience: a plain progressive-HTTP MP3 stream (no HLS, no
+//  jitter buffer) has no graceful story for a degrading mobile connection —
+//  the existing SUB/WAVE iOS app is known to loop small chunks of stale
+//  buffered audio (or half a spoken line) forever when a connection turns
+//  patchy, which is exactly the kind of dead zone a drive through rural
+//  DE/SE/DK produces. Rather than let AVPlayer sit stalled indefinitely and
+//  risk the same thing, a stall past a short grace period mutes output
+//  (silence over a glitch/loop, always) and forces a fresh reconnect with
+//  backoff, surfaced as `connectionState` so the UI can show a plain
+//  "poor signal" state instead of pretending everything is fine.
 
 import AVFoundation
 import MediaPlayer
 import Observation
 import UIKit
 
+enum ConnectionState {
+    /// Playing normally.
+    case live
+    /// A stall was just detected; still inside the short grace period
+    /// before treating it as a real problem (brief network hiccups are
+    /// normal and shouldn't flip into "poor signal" for a stutter that
+    /// clears itself in a second or two).
+    case buffering
+    /// Stalled past the grace period; actively reconnecting with backoff.
+    case poorSignal
+    /// Several reconnect attempts have failed; still retrying, just slower.
+    case disconnected
+}
+
 @Observable
 final class PlayerService {
     private(set) var isPlaying = false
     private(set) var playerError: String?
+    private(set) var connectionState: ConnectionState = .live
 
     private var player: AVPlayer?
     private var statusObservation: NSKeyValueObservation?
+    private var timeControlObservation: NSKeyValueObservation?
+    private var stallTask: Task<Void, Never>?
+    private var reconnectAttempts = 0
+    private var currentStation: Station?
     private var stationName: String = "SUB/WAVE"
+
+    private static let stallGrace: Duration = .seconds(8)
+    private static let maxBackoff: Double = 30
+    private static let attemptsBeforeDisconnected = 3
 
     func configure(station: Station) {
         stop()
         playerError = nil
-        activateAudioSession()
-
-        guard let resolved = station.resolvedAddress else {
-            playerError = "Invalid station address."
-            return
-        }
+        connectionState = .live
+        reconnectAttempts = 0
+        currentStation = station
         stationName = station.name
-
-        let streamURL = resolved.baseURL.appendingPathComponent("/stream.mp3")
-        var headers: [String: String] = [:]
-        if let credentials = resolved.credentials {
-            let raw = "\(credentials.username):\(credentials.password)"
-            if let token = raw.data(using: .utf8)?.base64EncodedString() {
-                headers["Authorization"] = "Basic \(token)"
-            }
-        }
-
-        // "AVURLAssetHTTPHeaderFieldsKey" — no longer declared in recent
-        // SDKs' public AVFoundation headers, but still present in the linked
-        // binary and still the documented way native SUB/WAVE clients attach
-        // the stream Authorization header (docs/private-station.md).
-        let asset = AVURLAsset(url: streamURL, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
-        let item = AVPlayerItem(asset: asset)
-        let player = AVPlayer(playerItem: item)
-        self.player = player
-
-        statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
-            Task { @MainActor in
-                switch item.status {
-                case .failed:
-                    self?.playerError = item.error?.localizedDescription ?? "Stream unreachable."
-                    self?.isPlaying = false
-                default:
-                    break
-                }
-            }
-        }
-
+        activateAudioSession()
+        buildPlayerItem(for: station)
         setUpRemoteCommands()
     }
 
@@ -98,14 +100,18 @@ final class PlayerService {
         player = nil
         isPlaying = false
         statusObservation = nil
+        timeControlObservation = nil
+        stallTask?.cancel()
+        stallTask = nil
+        currentStation = nil
     }
 
     /// Called by the now-playing poller so the lock screen, Control Center,
     /// and CarPlay's now-playing screen all reflect the current track.
     func updateNowPlayingInfo(track: Track?, coverImage: UIImage?) {
         var info: [String: Any] = [
-            MPMediaItemPropertyTitle: track?.title ?? stationName,
-            MPMediaItemPropertyArtist: track?.artist ?? "",
+            MPMediaItemPropertyTitle: displayTitle(track: track),
+            MPMediaItemPropertyArtist: connectionState == .live ? (track?.artist ?? "") : "",
             MPNowPlayingInfoPropertyIsLiveStream: true,
             // CPNowPlayingTemplate (and Control Center) derive their
             // play/pause icon from this, not from asking the app directly —
@@ -113,14 +119,131 @@ final class PlayerService {
             // already playing.
             MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
         ]
-        if let album = track?.album {
+        if connectionState == .live, let album = track?.album {
             info[MPMediaItemPropertyAlbumTitle] = album
         }
-        if let coverImage {
+        if connectionState == .live, let coverImage {
             let artwork = MPMediaItemArtwork(boundsSize: coverImage.size) { _ in coverImage }
             info[MPMediaItemPropertyArtwork] = artwork
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+
+    /// A stale track title while actually silently stalled is more
+    /// misleading than showing nothing — say so plainly instead.
+    private func displayTitle(track: Track?) -> String {
+        switch connectionState {
+        case .live: return track?.title ?? stationName
+        case .buffering: return "Buffering…"
+        case .poorSignal: return "Poor Signal — Reconnecting…"
+        case .disconnected: return "Disconnected — Retrying…"
+        }
+    }
+
+    // MARK: - Playback item construction
+
+    private func buildPlayerItem(for station: Station) {
+        guard let resolved = station.resolvedAddress else {
+            playerError = "Invalid station address."
+            return
+        }
+
+        let streamURL = resolved.baseURL.appendingPathComponent("/stream.mp3")
+        var headers: [String: String] = [:]
+        if let credentials = resolved.credentials {
+            let raw = "\(credentials.username):\(credentials.password)"
+            if let token = raw.data(using: .utf8)?.base64EncodedString() {
+                headers["Authorization"] = "Basic \(token)"
+            }
+        }
+
+        // "AVURLAssetHTTPHeaderFieldsKey" — no longer declared in recent
+        // SDKs' public AVFoundation headers, but still present in the linked
+        // binary and still the documented way native SUB/WAVE clients attach
+        // the stream Authorization header (docs/private-station.md).
+        let asset = AVURLAsset(url: streamURL, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
+        let item = AVPlayerItem(asset: asset)
+
+        statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+            Task { @MainActor in
+                guard case .failed = item.status else { return }
+                self?.playerError = item.error?.localizedDescription ?? "Stream unreachable."
+                self?.isPlaying = false
+                // A failed item is a harder failure than a stall, but the
+                // same recovery path applies: mute, back off, retry.
+                self?.beginStallWatch()
+            }
+        }
+
+        if let player {
+            player.replaceCurrentItem(with: item)
+        } else {
+            let player = AVPlayer(playerItem: item)
+            self.player = player
+            timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
+                Task { @MainActor in
+                    self?.handleTimeControlChange(player.timeControlStatus, reason: player.reasonForWaitingToPlay)
+                }
+            }
+        }
+    }
+
+    private func handleTimeControlChange(_ status: AVPlayer.TimeControlStatus, reason: AVPlayer.WaitingReason?) {
+        switch status {
+        case .playing:
+            recoverToLive()
+        case .waitingToPlayAtSpecifiedRate:
+            // `.evaluatingBufferingRate` is normal start-of-playback
+            // buffering, not a network problem; `.toMinimizeStalls` is the
+            // one that means "playback had started and just stalled".
+            guard reason == .toMinimizeStalls else { return }
+            beginStallWatch()
+        case .paused:
+            break
+        @unknown default:
+            break
+        }
+    }
+
+    private func recoverToLive() {
+        stallTask?.cancel()
+        stallTask = nil
+        reconnectAttempts = 0
+        connectionState = .live
+        player?.volume = 1
+    }
+
+    private func beginStallWatch() {
+        guard stallTask == nil else { return }
+        connectionState = .buffering
+        stallTask = Task { [weak self] in
+            await self?.stallLoop()
+        }
+    }
+
+    /// Waits out the grace period, then — if still not playing — mutes,
+    /// rebuilds the connection, and keeps retrying with backoff until
+    /// playback resumes (detected via `handleTimeControlChange` cancelling
+    /// this task) or the task is cancelled some other way (station
+    /// changed, stopped).
+    private func stallLoop() async {
+        try? await Task.sleep(for: Self.stallGrace)
+        guard !Task.isCancelled else { return }
+
+        while !Task.isCancelled {
+            guard let player, player.timeControlStatus != .playing else { return }
+            guard let station = currentStation else { return }
+
+            player.volume = 0
+            reconnectAttempts += 1
+            connectionState = reconnectAttempts >= Self.attemptsBeforeDisconnected ? .disconnected : .poorSignal
+
+            buildPlayerItem(for: station)
+            player.play()
+
+            let backoff = min(Double(reconnectAttempts) * 10, Self.maxBackoff)
+            try? await Task.sleep(for: .seconds(backoff))
+        }
     }
 
     /// Nudges just the play/pause icon state immediately on toggle, rather

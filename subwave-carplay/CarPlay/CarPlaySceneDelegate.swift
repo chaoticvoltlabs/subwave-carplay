@@ -25,6 +25,14 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
     ) {
         self.interfaceController = interfaceController
         interfaceController.setRootTemplate(makeStationListTemplate(), animated: true, completion: nil)
+
+        // A station picked from the phone before ever connecting to CarPlay
+        // (the common case: start the radio at home, then get in the car)
+        // should land the driver straight on Now Playing, not make them
+        // reselect from the list to see what's already playing.
+        if AppModel.shared.stationStore.selectedStation != nil {
+            interfaceController.pushTemplate(CPNowPlayingTemplate.shared, animated: false, completion: nil)
+        }
     }
 
     func templateApplicationScene(

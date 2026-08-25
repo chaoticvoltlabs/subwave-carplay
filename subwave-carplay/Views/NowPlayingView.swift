@@ -27,6 +27,8 @@ struct NowPlayingView: View {
             VStack(spacing: 24) {
                 coverArt
 
+                connectionBanner
+
                 VStack(spacing: 6) {
                     Text(model.nowPlaying?.nowPlaying?.title ?? "—")
                         .font(.title2.bold())
@@ -87,6 +89,29 @@ struct NowPlayingView: View {
             if let client {
                 RequestSongView(client: client)
             }
+        }
+    }
+
+    /// Silence during a stall is intentional (see PlayerService) — this is
+    /// what tells a listener *why* it's quiet instead of leaving them
+    /// wondering if the app just died.
+    @ViewBuilder
+    private var connectionBanner: some View {
+        switch model.player.connectionState {
+        case .live:
+            EmptyView()
+        case .buffering:
+            Label("Buffering…", systemImage: "arrow.triangle.2.circlepath")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .poorSignal:
+            Label("Poor Signal — Reconnecting…", systemImage: "wifi.exclamationmark")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.orange)
+        case .disconnected:
+            Label("Disconnected — Retrying…", systemImage: "wifi.slash")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.red)
         }
     }
 
