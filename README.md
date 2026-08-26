@@ -1,58 +1,66 @@
 # subwave-carplay
 
 A CarPlay-first [SUB/WAVE](https://github.com/perminder-klair/subwave) listener
-client. Sibling project to [subwave-tvos](../subwave-tvos), sharing the same
-API models/networking approach but a deliberately much smaller surface — see
-"Scope" below.
+client — an internet radio platform where an AI DJ hosts the show, picks
+music, and takes listener song requests live.
 
 ## Hard design rule
 
 The driver never has to touch this app's own UI to keep the broadcast going.
 Pick a station — from the phone or from CarPlay's own list — and it just
-plays, phone screen off or away, until paused. Playback, polling, and
-now-playing metadata are all owned by `AppModel` (a shared singleton), not by
-any SwiftUI view's lifecycle — confirmed necessary by testing in the CarPlay
-Simulator: a first pass that ran the poll loop from `NowPlayingView.task`
-left CarPlay showing no track metadata and the wrong play/pause icon,
-because nothing was polling `/now-playing` while the phone UI was never on
-screen.
+plays, phone screen off or away, until paused. Everything else is a bonus,
+not a requirement for a drive.
 
 ## Scope
 
-CarPlay's own Human Interface Guidelines rule out most of what subwave-tvos
-has: no free-text entry while driving, no reading a Booth log or programme
-guide off a car display. The whole CarPlay surface here is:
+CarPlay's Human Interface Guidelines rule out free-text entry and dense
+browsing while driving, so the CarPlay surface is deliberately small:
 
-- `CPListTemplate` — station list
-- `CPNowPlayingTemplate` — playback, transport controls, track metadata
-  (mirrors `MPNowPlayingInfoCenter`/`MPRemoteCommandCenter` automatically, so
-  `PlayerService`'s existing remote-command wiring drives it with no
-  CarPlay-specific plumbing)
+- Station list
+- Now Playing — playback, transport controls, track metadata
 
-Station add/edit, song requests, and everything else live on the phone-only
-side (`Views/`), for setup before a drive, not during one.
+Adding or editing stations and song requests live on the phone-only side, for
+setup before a drive, not during one.
 
-## CarPlay entitlement
+## Features
 
-Shipping this (TestFlight or App Store, or running on a car's real head
-unit) requires Apple's CarPlay Audio App entitlement
-(`com.apple.developer.carplay-audio`), a manual, separate approval — not yet
-requested as of this project's creation. The entitlement is already in
-`subwave_carplay.entitlements` so local development and testing against the
-CarPlay Simulator work regardless; only real-hardware/store distribution is
-blocked until Apple approves it.
+- CarPlay station list and Now Playing screen, with full transport control
+  and Control Center / lock screen integration
+- Station picker on the phone (add, edit, remove stations)
+- Song requests from the phone
+- Private-station support via HTTP Basic Auth
+- Stream resilience: on a poor connection, the app mutes and shows a clear
+  "Buffering" / "Poor Signal" / "Disconnected" state and retries with
+  backoff, instead of looping stale audio
 
-## Testing without a car
+## Requirements
 
-Xcode's iOS Simulator can show a CarPlay display: boot a simulator, then
-**Simulator → I/O → External Displays → CarPlay** (menu path/wording varies
-by Xcode version). The app's icon appears in the CarPlay home screen dock.
+- iOS 26 or later
+- Xcode 26 or later, to build
+- An Apple Developer account with the CarPlay Audio App entitlement
+  approved, to run on a physical CarPlay head unit (not required for the
+  CarPlay Simulator)
 
-## Architecture note
+## Getting started
 
-`AppModel.shared` (in `AppModel.swift`) is the one shared owner of
-`StationStore` and `PlayerService`. `CPTemplateApplicationSceneDelegate` is
-instantiated by UIKit from Info.plist with no initializer this code
-controls, so there's no SwiftUI environment to inject into it — a singleton
-is the standard way both the phone UI scene and the CarPlay scene reach the
-same playback state.
+1. Clone the repo and open `subwave-carplay.xcodeproj` in Xcode.
+2. Build and run on an iPhone Simulator or a physical iPhone, then add a
+   station by its address.
+3. To preview the CarPlay screen without a car: boot the app, then
+   **Simulator → I/O → External Displays → CarPlay** (menu wording varies by
+   Xcode version). The app's icon appears in the CarPlay home screen dock.
+
+## Private stations
+
+To add a station with the stream/private-player password on, type the
+address as `username:password@host` — the username can be anything (e.g.
+`dj:`), only the password after the colon is actually checked. Easy to miss:
+typing just the password with no `user:` prefix isn't a valid address and
+won't authenticate.
+
+## Copyright & license
+
+PolyForm Noncommercial License 1.0.0 with Commercial Use by Explicit
+Permission Only. See [LICENSE.txt](LICENSE.txt).
+
+Copyright (c) 2026 Robin Kluit / Chaoticvolt.
