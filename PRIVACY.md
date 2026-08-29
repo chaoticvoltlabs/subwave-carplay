@@ -1,6 +1,6 @@
 # Privacy Policy
 
-**subwave-carplay** (SUB/WAVE for CarPlay)
+**Subwave Road**
 Last updated: 2026-08-26
 
 This app does not collect, store, or transmit any personal data to the

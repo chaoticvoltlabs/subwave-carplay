@@ -1,8 +1,13 @@
-# subwave-carplay
+# Subwave Road
 
 A CarPlay-first [SUB/WAVE](https://github.com/perminder-klair/subwave) listener
 client — an internet radio platform where an AI DJ hosts the show, picks
 music, and takes listener song requests live.
+
+(Internally still named `subwave-carplay` — bundle identifier, Xcode
+project, and this repo's technical name are unchanged; only the
+user-facing app name is "Subwave Road", since Apple doesn't allow
+third-party apps to use "CarPlay" in their name.)
 
 ## Hard design rule
 
